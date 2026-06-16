@@ -86,7 +86,6 @@ def run_threshold(
         train,
         bins=np.arange(0, Tmax + params["binsize"], params["binsize"]),
     )
-    bin_centers = np.array(bins[0:-1]) + params["binsize"] / 2
 
     if params["smooth_sd_counts"] is not None:
         smoothed_bin_counts = gaussian_filter1d(
@@ -169,7 +168,7 @@ def run_threshold(
         + 0.001,  # +epsilon to avoid weird rounding effect in histogram
     )
     duration_bin_centers_pre = (
-        np.array(duration_bins_pre[0:-1]) + np.array(duration_bins_pre[0:-1])
+        np.array(duration_bins_pre[0:-1]) + np.array(duration_bins_pre[1:])
     ) / 2
     if params.get("gap_threshold", None) is not None:
         print("Get gap threshold from params...", end="")

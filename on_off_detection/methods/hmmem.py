@@ -33,10 +33,11 @@ For cortical data I recommend 100Hz minimum population rate, init_state_off_on_f
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
-from scipy.special import factorial
+from scipy.special import gammaln
 
 from .. import utils
 from .exceptions import NumericalErrorException, FailedInitializationException
+from .sticky import _forward_backward, _viterbi
 
 
 HMMEM_PARAMS = {
@@ -105,19 +106,18 @@ def run_hmmem(
 
     # Fit init_alphaa, init_mu and init_betaa ?
     if all([params[p] is None for p in ["init_alphaa", "init_mu", "init_betaa"]]):
-        fitted_init_params = True
         init_mu, init_alphaa, init_betaa = fit_init_poisson_params(
             bin_spike_count_trimmed[0, :],
             bin_history_spike_count_trimmed[0, :],
             params["binsize"],
             init_state_off_on_fr_ratio_thresh=params["init_state_off_on_fr_ratio_thresh"],
+            verbose=verbose,
         )
     else:
         if any([params[k] is None for k in ["init_alphaa", "init_mu", "init_betaa"]]):
             raise ValueError(
                 "'init_alphaa', 'init_mu' and 'init_betaa' params should either be all floats or all None."
             )
-        fitted_init_params = False
         init_alphaa = params["init_alphaa"]
         init_mu = params["init_mu"]
         init_betaa = params["init_betaa"]
@@ -252,117 +252,57 @@ def _run_hmmem(
 
     # Constants
     EPS = np.spacing(1)
-    STATES = [0, 1]
+    STATES = np.array([0.0, 1.0])  # OFF, ON
 
-    # Output vars
-    A = init_A.copy()
-    alphaa = init_alphaa
-    betaa = init_betaa
-    mu = init_mu
+    A = init_A.copy().astype(float)
+    alphaa = float(init_alphaa)
+    betaa = float(init_betaa)
+    mu = float(init_mu)
 
     nbins = bin_spike_count.shape[1]
+    counts = bin_spike_count[0]  # (nbins,)
+    hist = bin_history_spike_count[0].astype(float)  # (nbins,)
+    log_factorial = gammaln(counts.astype(float) + 1.0)
 
-    # Eq 2.3
-    bin_lambda = np.zeros((2, nbins), dtype=float)
-    for k in range(nbins):
-        for state_i in range(len(STATES)):
-            bin_lambda[state_i, k] = np.exp(
-                mu
-                + alphaa * STATES[state_i]
-                + betaa * bin_history_spike_count[0, k]  # TODO if betaa not scalar
-            )
+    def _emissions(mu, alphaa, betaa):
+        # Poisson emission matrix B (2, nbins). Chen et al. 2009 eqs 2.2-2.3:
+        # log lambda = mu + alphaa*state + betaa*history; B = Poisson(count|lambda).
+        lam = np.exp(mu + alphaa * STATES[:, None] + betaa * hist[None, :])
+        logB = counts[None, :] * np.log(lam + EPS) - lam - log_factorial[None, :]
+        return np.exp(logB)
 
-    # Eq 2.2
-    B = np.empty((2, nbins), dtype=float)
-    for state_i in range(len(STATES)):
-        B[state_i, :] = (
-            np.exp(-bin_lambda[state_i, :])
-            * np.power(bin_lambda[state_i, :], bin_spike_count)
-            / factorial(bin_spike_count)
-        )
+    B = _emissions(mu, alphaa, betaa)
+    p0 = 0.5 * np.ones(2)
 
-    p0 = 0.5 * np.ones((2,))
-    # alpha[k]: forward message of state i at time k
-    # beta[k]: backward message of state i at time k
-    # gamma[k]: marginal conditional probability at time k: P(Sk = i | H)
-    # zeta[i, j, k]:  joint conditional probability: P(Sk-1 = i , Sk = j | H)
-    alpha, beta, gamma = [np.zeros((2, nbins), dtype=float) for _ in range(3)]
-    zeta = np.zeros((2, 2, nbins), dtype=float)
-
-    # Forward-backward E-M algorithm
-    t = 0
+    # Forward-backward E-M. The sequential forward/backward and Viterbi scans are
+    # the numba-JIT helpers shared with the sticky method; emissions, posteriors
+    # (gamma), and expected transition counts (zeta_sum) are vectorized numpy.
     log_P = np.empty((n_iter_EM,), dtype=float)
-    diff_log_P = 10
-    while (
-        t < n_iter_EM and diff_log_P > 0
-    ):  # Differ from original MATLAB algo here (it uses n_iter_EM - 1)
-
-        ## E-step: forward algorithm
-
-        # Compute alpha (k=0)
-        C = np.zeros((nbins,))  # Scaling vector to avoid numerical inaccuracies
-        alpha[:, 0] = p0 * B[:, 0]
-        C[0] = np.sum(alpha[:, 0], axis=None)
-        alpha[:, 0] = alpha[:, 0] / C[0]  # Scaling
-        for k in range(1, nbins):
-            # Compute alpha (k > 0)
-            alpha[:, k] = np.multiply(
-                np.matmul(alpha[:, k - 1].transpose(), A), B[:, k]
+    gamma = np.zeros((2, nbins))
+    t = 0
+    diff_log_P = 10.0
+    while t < n_iter_EM and diff_log_P > 0:
+        alpha, beta, C = _forward_backward(B, A, p0)
+        if not np.all(np.isfinite(C)) or np.any(C <= 0):
+            raise NumericalErrorException(
+                f"Numerical error in forward-backward scaling (EM step t={t})"
             )
-            C[k] = np.sum(alpha[:, k], axis=None)
-            if C[k] > 0:
-                alpha[:, k] = alpha[:, k] / C[k]
-            else:
-                raise NumericalErrorException(
-                    f"Numerical error when scaling alpha[k] "
-                    f"(EM step t = {t}, bin index k = {k})"
-                )
+        log_P[t] = np.sum(np.log(C + EPS))
 
-        log_P[t] = np.sum(np.log(C[0:nbins] + EPS))
+        gamma = alpha * beta
+        gamma /= gamma.sum(axis=0, keepdims=True) + EPS
 
-        ## E-step: backward algorithm
+        # Expected transition counts summed over time (vectorized zeta):
+        # zeta_sum[i,j] = A[i,j] * sum_k alpha[i,k] (B[j,k+1] beta[j,k+1]) / s_k.
+        a = alpha[:, :-1]
+        bB = B[:, 1:] * beta[:, 1:]
+        s_k = np.einsum("ik,ik->k", a, A @ bB) + EPS
+        zeta_sum = A * ((a / s_k[None, :]) @ bB.T)
 
-        # Compute beta
-        beta[:, -1] = 1
-        beta[:, -1] = beta[:, -1] / C[-1]
-        for k in range(nbins - 2, -1, -1):
-            beta[:, k : k + 1] = np.matmul(
-                A, np.multiply(beta[:, k + 1 : k + 2], B[:, k + 1 : k + 2])
-            )
-            beta[:, k] = beta[:, k] / C[k]
-
-        for k in range(0, nbins - 1):
-            temp = np.multiply(
-                np.matmul(
-                    alpha[:, k : k + 1],
-                    np.multiply(
-                        beta[:, k + 1 : k + 2], B[:, k + 1 : k + 2]
-                    ).transpose(),
-                ),
-                A,
-            )
-            if np.sum(temp, axis=None) > 0:
-                zeta[:, :, k] = temp / np.sum(temp, axis=None)
-            else:
-                raise NumericalErrorException(
-                    f"Numerical error when scaling zeta_i_j[k] "
-                    f"(EM step t = {t}, bin index k = {k})"
-                )
-            gamma[:, k] = np.sum(zeta[:, :, k], axis=1)
-
-        # Sufficient statistics
-        # Z = E[S]
-        Z = STATES[0] * gamma[0, :] + STATES[1] * gamma[1, :]
-
-        ## M-step:
-
-        # Update transition matrix
-        p0 = gamma[:, 0]
-        temp1 = np.sum(zeta, axis=2)
-        temp2 = np.sum(gamma, axis=1, keepdims=True)
-        A = temp1 / np.tile(temp2, (1, 2))
-
-        # Update alphaa/betaa/mu
+        # M-step: transition matrix + GLM params (Newton-Raphson).
+        p0 = gamma[:, 0].copy()
+        A = zeta_sum / (zeta_sum.sum(axis=1, keepdims=True) + EPS)
+        Z = gamma[1, :]  # E[S], since STATES = [0, 1]
         alphaa, betaa, mu = newton_ralphson(
             bin_spike_count,
             Z,
@@ -372,80 +312,27 @@ def _run_hmmem(
             mu,
             n_iter_newton_ralphson,
         )
+        B = _emissions(mu, alphaa, betaa)
 
-        # Update lambda cif
-        for k in range(nbins):
-            for state_i in range(len(STATES)):
-                bin_lambda[state_i, k] = np.exp(
-                    mu
-                    + alphaa * STATES[state_i]
-                    + betaa * bin_history_spike_count[0, k]  # TODO if betaa not scalar
-                )
-
-        # Update B
-        for state_i in range(len(STATES)):
-            B[state_i, :] = (
-                np.exp(-bin_lambda[state_i, :])
-                * np.power(bin_lambda[state_i, :], bin_spike_count)
-                / factorial(bin_spike_count)
-            )
-
-        # Verbose and increment
         if verbose:
             print(
-                f"n_iter_EM={t}, log-likelihood={log_P[t]}, mu={mu}, alpha={alphaa}, beta={betaa}, A={A}"
+                f"n_iter_EM={t}, log-likelihood={log_P[t]}, mu={mu}, "
+                f"alpha={alphaa}, beta={betaa}, A={A}"
             )
         if t > 1:
             diff_log_P = log_P[t] - log_P[t - 1]
         t += 1
 
-        ## End E-M Loop
-
-    end_iter_EM = t - 1  # (Since we just incremented)
-    EM_converged = t < n_iter_EM  # (idem)
+    end_iter_EM = t - 1
+    EM_converged = t < n_iter_EM
 
     prob_S = gamma  # 2 x nbins
-    mean_S = (
-        STATES[0] * gamma[0:1, :] + STATES[1] * gamma[1:, :]
-    )  # Expected mean, 1 x nbins
     p0 = gamma[:, 0:1]  # 2 x 1
 
-    # Viterbi algorithm for decoding most likely states
-    delta = np.zeros((2, nbins))
-    psi = np.zeros((2, nbins), dtype=int)
-    S = np.zeros((1, nbins), dtype=int)
-
-    # Working in log-domain
-    log_P0 = np.log(p0 + EPS)
-    logA = np.log(A + EPS)
-    logB = np.log(B + EPS)
-
-    delta[:, 0:1] = log_P0 + logB[:, 0:1]  # 2 x 1
-    psi[:, 1:2] = 0
-
-    for t in range(1, nbins):
-        # Maximum and argmax of every row (col?)
-        temp = np.transpose(np.matmul(delta[:, t - 1 : t], np.ones((1, 2))) + logA)
-        # psi[:, t:t+1] = np.argmax(temp, axis=1, keepdims=True)
-        psi[:, t : t + 1] = np.expand_dims(
-            np.argmax(temp, axis=1), axis=1
-        )  # no keepdims kwarg for numpy <= 1.21
-        # delta[:, t:t+1] = np.max(temp, axis=1, keepdims=True) + logB[:, t:t+1]
-        delta[:, t : t + 1] = (
-            np.expand_dims(np.max(temp, axis=1), axis=1) + logB[:, t : t + 1]
-        )  # no keepdims kwarg for numpy <= 1.21
-
-    # State estimate
-    S[0, -1] = np.argmax(delta[:, -1], axis=None)
-    log_L = (
-        delta[S[0, -1], -1] / nbins
-    )  # TODO: Is this correct? Where is likelihood of each state?
-    for t in range(nbins - 2, -1, -1):
-        S[0, t] = psi[S[0, t + 1], t + 1]
-
-    p0 = np.exp(p0)
-    if not set(STATES) == set([0, 1]):
-        raise NotImplementedError
+    # Viterbi decoding (numba, log-domain).
+    states = _viterbi(np.log(gamma[:, 0] + EPS), np.log(A + EPS), np.log(B + EPS))
+    S = states.reshape(1, -1).astype(int)
+    log_L = float(log_P[end_iter_EM])
 
     return (
         S,
@@ -539,6 +426,7 @@ def fit_init_poisson_params(
     bin_history_spike_count,
     binsize,
     init_state_off_on_fr_ratio_thresh=None,
+    verbose=True,
 ):  # 1D arrays
 
     ## Result
@@ -560,10 +448,11 @@ def fit_init_poisson_params(
         )
     )
     # count ~ mu + alphaa * state + betaa * bin_history
-    mod = sm.GLM(endog, exog, family=sm.families.Poisson(link=sm.families.links.log()))
+    mod = sm.GLM(endog, exog, family=sm.families.Poisson(link=sm.families.links.Log()))
     res = mod.fit()
 
-    print(res.summary())
+    if verbose:
+        print(res.summary())
 
     return res.params.values
 
