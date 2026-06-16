@@ -1,5 +1,11 @@
 # on_off_detection: Detect ON/OFF periods from MUA or single-unit activity.
 
+> **Workspace fork notes.** Methods: `threshold`, `hmmem`, and `sticky`
+> (a sticky 2-state Poisson HMM after Li & La Camera 2025; numba-accelerated
+> forward-backward/Viterbi with a pure-numpy fallback). Also fixed a duration
+> histogram bin-center bug in `methods/threshold.py` and gated the statsmodels
+> GLM summary print in `methods/hmmem.py` behind `verbose`. Installed editable in
+> the `gfys_workspace` uv environment. Tests in `tests/`.
 
 ## Examples
 
@@ -51,6 +57,16 @@ on_off_params = {
     'init_alphaa': None,  # ~ difference between ON and OFF rate. Fitted to data if None
     'init_betaa': None, # ~ Weight of recent history firing rate. Fitted to data if None,
     'gap_threshold': None, # Merge active states separated by less than gap_threhsold
+}
+#### Sticky Poisson-HMM ########
+on_off_method = 'sticky'  # Implements: Li & La Camera 2025, "A sticky Poisson hidden Markov model...", PLOS One
+on_off_params = {
+    'binsize': 0.010,       # (s)
+    'min_dwell': 0.050,     # (s) minimum expected dwell -> self-transition floor delta = 1 - binsize/min_dwell
+    'off_rate_max': 20.0,   # (Hz) near-silence cap on the OFF-state rate (None disables). OFF = (near-)silent population.
+    'n_iter_EM': 100,       # max Baum-Welch iterations
+    'tol': 1e-4,            # log-likelihood convergence tolerance
+    'min_off_duration': None,  # (s) optional post-hoc merge of short OFFs
 }
 ##########
 

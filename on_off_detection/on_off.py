@@ -5,17 +5,20 @@ import pandas as pd
 from tqdm import tqdm
 
 from .methods.hmmem import HMMEM_PARAMS, run_hmmem
+from .methods.sticky import STICKY_PARAMS, run_sticky
 from .methods.threshold import THRESHOLD_PARAMS, run_threshold
 from .utils import subset_sorted_train, kway_mergesort, slice_and_concat_sorted_train
 
 METHODS = {
     "threshold": run_threshold,
     "hmmem": run_hmmem,
+    "sticky": run_sticky,
 }
 
 DF_PARAMS = {
     "threshold": THRESHOLD_PARAMS,
     "hmmem": HMMEM_PARAMS,
+    "sticky": STICKY_PARAMS,
 }
 
 

@@ -1,3 +1,5 @@
+import itertools as it
+
 import pandas as pd
 import numpy as np
 from tqdm import tqdm

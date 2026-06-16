@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "on_off_detection"
+version = "0.1.dev0"
+description = "Detect ON and OFF periods from unit activity"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Tom Bugnon", email = "tombugnon@hotmail.com" }]
+dependencies = [
+    "matplotlib",
+    "numpy",
+    "pandas",
+    "scipy",
+    "statsmodels",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+parallel = ["joblib"]
+
+[project.urls]
+Homepage = "https://github.com/CSC-UW/on_off_detection"
+
+[tool.setuptools.packages.find]
+include = ["on_off_detection*"]
+
+[dependency-groups]
+dev = ["pytest>=7.0.0"]
