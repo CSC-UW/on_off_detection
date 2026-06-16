@@ -86,6 +86,26 @@ def test_sticky_off_rate_max_caps_off_state():
     assert info_u["lambda_off"] > info["lambda_off"]
 
 
+def test_sticky_off_rate_max_zero_is_a_valid_cap():
+    """off_rate_max=0.0 (cap0) means a silent OFF state, distinct from None.
+
+    Regression: run_sticky used ``if off_rate_max`` to gate the cap, which folds
+    0.0 into the no-cap branch. 0.0 must force lambda_off ~ 0 (OFF = silent), and
+    must differ from None (uncapped), where the OFF state settles much higher.
+    """
+    train, Tmax, _ = _make_two_state_train(on_rate=300.0, off_rate=80.0, n_cycles=200)
+
+    params0 = dict(DF_PARAMS["sticky"])
+    params0["off_rate_max"] = 0.0
+    _, info0 = METHODS["sticky"](train, Tmax, params0, verbose=False)
+    assert info0["lambda_off"] <= 1e-3  # essentially silent
+
+    params_none = dict(DF_PARAMS["sticky"])
+    params_none["off_rate_max"] = None
+    _, info_n = METHODS["sticky"](train, Tmax, params_none, verbose=False)
+    assert info_n["lambda_off"] > info0["lambda_off"]
+
+
 def test_sticky_min_dwell_floors_self_transition():
     """A larger min_dwell should not crash and should yield a sticky A matrix."""
     train, Tmax, _ = _make_two_state_train()

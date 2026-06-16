@@ -56,8 +56,12 @@ STICKY_PARAMS = {
     "min_dwell": 0.050,
     # (Hz) near-silence constraint: cap the OFF-state mean firing rate at
     # off_rate_max during EM, so OFF means "(near-)silent population" rather than
-    # merely "lower rate than ON". Matches mua-bugnon's deep, rare OFFs. None
-    # disables the cap (pure unconstrained 2-state Poisson HMM).
+    # merely "lower rate than ON". Matches mua-bugnon's deep, rare OFFs.
+    #   None -> no cap (pure unconstrained 2-state Poisson HMM)
+    #   0.0  -> OFF is the silent (zero-count) state; parameter-free and
+    #           structure-invariant (no per-structure / per-unit rate to tune)
+    #   >0   -> absolute Hz cap (does NOT generalize across structures; see the
+    #           offproj cap-scheme sweep)
     "off_rate_max": None,
     "n_iter_EM": 100,  # Max Baum-Welch iterations
     "tol": 1e-4,  # Log-likelihood convergence tolerance
@@ -178,34 +182,48 @@ def _states_to_df(active_bin: np.ndarray, srate: float) -> pd.DataFrame:
     )
 
 
-def run_sticky(train, Tmax, params, verbose=True):
-    """Detect ON/OFF periods with a sticky 2-state Poisson HMM.
+def _run_sticky_on_counts(
+    counts,
+    binsize,
+    *,
+    min_dwell=0.050,
+    off_cap_counts=None,
+    n_iter_EM=100,
+    tol=1e-4,
+    min_off_duration=None,
+    verbose=False,
+):
+    """Fit a sticky 2-state Poisson HMM to a pre-binned count vector.
+
+    This is the count-based core shared by :func:`run_sticky` and by external
+    callers that have already binned an observable (e.g. pooled spike counts or
+    the number of active units per bin, for the fraction-of-units-active variant).
 
     Args:
-        train (array-like): Pooled, sorted spike times (seconds).
-        Tmax (float): Recording (or cut-and-concatenated bouts) duration (seconds).
-        params (dict): See :data:`STICKY_PARAMS`.
-        verbose (bool): Print progress.
+        counts (np.ndarray): Integer observation per bin (e.g. pooled spike
+            count, or active-unit count). The "OFF" state is the low-mean state.
+        binsize (float): Bin size (s); only used for the ``min_dwell`` floor and
+            the optional short-OFF merge.
+        min_dwell (float | None): Minimum expected dwell (s) -> self-transition
+            floor ``delta = 1 - binsize / min_dwell``. None/<=binsize disables it.
+        off_cap_counts (float | None): Cap on the OFF-state mean emission, in the
+            same units as ``counts`` (NOT Hz). ``None`` disables the cap; ``0.0``
+            forces an essentially silent OFF state (OFF = zero-count bins).
+        n_iter_EM (int): Max Baum-Welch iterations.
+        tol (float): Log-likelihood convergence tolerance.
+        min_off_duration (float | None): Post-hoc merge of OFFs shorter than this (s).
+        verbose (bool): Print EM progress.
 
     Returns:
-        (pd.DataFrame, dict): ``on_off_df`` with 'state'/'start_time'/'end_time'/
-        'duration' columns and an ``output_info`` dict.
+        (np.ndarray, dict): ``active_bin`` (1 = ON, 0 = OFF) and an info dict
+        (``lambda_off``/``lambda_on``/``A``/``delta``/``log_L``/``end_iter_EM``/
+        ``EM_converged``).
     """
-    binsize = params["binsize"]
+    counts = np.asarray(counts, dtype=np.int64)
     srate = 1.0 / binsize
-
-    bins = np.arange(0, Tmax + binsize, binsize)
-    counts = np.histogram(train, bins=bins)[0].astype(np.int64)
     nbins = len(counts)
     if nbins < 2:
         raise FailedInitializationException("Fewer than 2 bins; cannot fit HMM.")
-
-    cumFR = len(train) / Tmax
-    if verbose:
-        print(
-            f"method=sticky, pop. rate = {cumFR:.1f}Hz, N={len(train)} spikes, "
-            f"nbins={nbins}, numba={_HAVE_NUMBA}, params={params}"
-        )
 
     # --- Initialization: split bins by count into low (OFF) / high (ON) states.
     init_off = counts <= np.quantile(counts, 0.5)
@@ -220,16 +238,12 @@ def run_sticky(train, Tmax, params, verbose=True):
     lam = np.clip(lam, 1e-6, None)
     if lam[1] <= lam[0]:
         lam[1] = lam[0] + 1e-3
-
-    off_rate_max = params.get("off_rate_max", None)
-    off_cap_counts = off_rate_max * binsize if off_rate_max else None
     lam = _cap_off_rate(lam, off_cap_counts)
 
     A = np.array([[0.9, 0.1], [0.1, 0.9]], dtype=float)
     p0 = np.array([init_off.mean(), 1.0 - init_off.mean()], dtype=float)
 
     # Self-transition floor from min_dwell (Li & La Camera stickiness).
-    min_dwell = params.get("min_dwell", None)
     delta = 1.0 - binsize / min_dwell if (min_dwell and min_dwell > binsize) else None
 
     log_counts_factorial = gammaln(counts + 1.0)
@@ -247,7 +261,7 @@ def run_sticky(train, Tmax, params, verbose=True):
     ll = -np.inf
     it = 0
     gamma = None
-    for it in range(int(params["n_iter_EM"])):
+    for it in range(int(n_iter_EM)):
         B = _emissions(lam)
         alpha, beta, c = _forward_backward(B, A, p0)
         if not np.all(np.isfinite(c)) or np.any(c <= 0):
@@ -283,16 +297,16 @@ def run_sticky(train, Tmax, params, verbose=True):
         lam = _cap_off_rate(lam, off_cap_counts)
         p0 = gamma[:, 0].copy()
 
-        if verbose and (it % 20 == 0 or it == int(params["n_iter_EM"]) - 1):
+        if verbose and (it % 20 == 0 or it == int(n_iter_EM) - 1):
             print(
                 f"  sticky EM it={it} ll={ll:.1f} lam={np.round(lam, 4)} "
                 f"A_diag={np.round(np.diag(A), 4)}"
             )
-        if it > 0 and abs(ll - prev_ll) < params["tol"]:
+        if it > 0 and abs(ll - prev_ll) < tol:
             break
         prev_ll = ll
 
-    converged = it < int(params["n_iter_EM"]) - 1
+    converged = it < int(n_iter_EM) - 1
 
     # Keep OFF as the low-rate state (index 0); swap if EM reordered.
     if lam[0] > lam[1]:
@@ -301,25 +315,20 @@ def run_sticky(train, Tmax, params, verbose=True):
         p0 = p0[::-1].copy()
 
     # Viterbi decoding.
-    logB = np.vstack(
-        [_poisson_logpmf(counts, lam[0]), _poisson_logpmf(counts, lam[1])]
-    )
+    logB = np.vstack([_poisson_logpmf(counts, lam[0]), _poisson_logpmf(counts, lam[1])])
     states = _viterbi(np.log(p0 + _EPS), np.log(A + _EPS), logB)
     active_bin = np.asarray(states, dtype=int)  # 1 = ON, 0 = OFF
 
     # Optional post-hoc merge of short OFFs.
-    min_off = params.get("min_off_duration", None)
-    if min_off is not None and min_off > 0:
+    if min_off_duration is not None and min_off_duration > 0:
         off_durations = utils.state_durations(active_bin, 0, srate=srate)
         off_starts = utils.state_starts(active_bin, 0)
         off_ends = utils.state_ends(active_bin, 0)
         for i, dur in enumerate(off_durations):
-            if dur <= min_off:
+            if dur <= min_off_duration:
                 active_bin[off_starts[i] : off_ends[i] + 1] = 1
 
-    on_off_df = _states_to_df(active_bin, srate)
-    output_info = {
-        "cumFR": cumFR,
+    info = {
         "lambda_off": float(lam[0]),
         "lambda_on": float(lam[1]),
         "A": A,
@@ -327,11 +336,59 @@ def run_sticky(train, Tmax, params, verbose=True):
         "log_L": ll,
         "end_iter_EM": int(it),
         "EM_converged": bool(converged),
-        "params": params,
     }
+    return active_bin, info
+
+
+def run_sticky(train, Tmax, params, verbose=True):
+    """Detect ON/OFF periods with a sticky 2-state Poisson HMM.
+
+    Args:
+        train (array-like): Pooled, sorted spike times (seconds).
+        Tmax (float): Recording (or cut-and-concatenated bouts) duration (seconds).
+        params (dict): See :data:`STICKY_PARAMS`.
+        verbose (bool): Print progress.
+
+    Returns:
+        (pd.DataFrame, dict): ``on_off_df`` with 'state'/'start_time'/'end_time'/
+        'duration' columns and an ``output_info`` dict.
+    """
+    binsize = params["binsize"]
+    srate = 1.0 / binsize
+
+    bins = np.arange(0, Tmax + binsize, binsize)
+    counts = np.histogram(train, bins=bins)[0].astype(np.int64)
+    nbins = len(counts)
+
+    cumFR = len(train) / Tmax
+    if verbose:
+        print(
+            f"method=sticky, pop. rate = {cumFR:.1f}Hz, N={len(train)} spikes, "
+            f"nbins={nbins}, numba={_HAVE_NUMBA}, params={params}"
+        )
+
+    off_rate_max = params.get("off_rate_max", None)
+    # off_rate_max=0.0 is a VALID cap (OFF = silent/zero-count state), distinct
+    # from None (no cap); don't fold 0.0 into the no-cap branch.
+    off_cap_counts = None if off_rate_max is None else off_rate_max * binsize
+
+    active_bin, info = _run_sticky_on_counts(
+        counts,
+        binsize,
+        min_dwell=params.get("min_dwell", None),
+        off_cap_counts=off_cap_counts,
+        n_iter_EM=params["n_iter_EM"],
+        tol=params["tol"],
+        min_off_duration=params.get("min_off_duration", None),
+        verbose=verbose,
+    )
+
+    on_off_df = _states_to_df(active_bin, srate)
+    output_info = {"cumFR": cumFR, **info, "params": params}
     if verbose:
         print(
             f"sticky: done. N_off={int((on_off_df['state'] == 'off').sum())}, "
-            f"lam_off={lam[0]:.3f}, lam_on={lam[1]:.3f}, converged={converged}"
+            f"lam_off={info['lambda_off']:.3f}, lam_on={info['lambda_on']:.3f}, "
+            f"converged={info['EM_converged']}"
         )
     return on_off_df, output_info
