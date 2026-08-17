@@ -56,7 +56,7 @@ STICKY_PARAMS = {
     "min_dwell": 0.050,
     # (Hz) near-silence constraint: cap the OFF-state mean firing rate at
     # off_rate_max during EM, so OFF means "(near-)silent population" rather than
-    # merely "lower rate than ON". Matches mua-bugnon's deep, rare OFFs.
+    # merely "lower rate than ON". Matches the morphological method's deep, rare OFFs.
     #   None -> no cap (pure unconstrained 2-state Poisson HMM)
     #   0.0  -> OFF is the silent (zero-count) state; parameter-free and
     #           structure-invariant (no per-structure / per-unit rate to tune)
